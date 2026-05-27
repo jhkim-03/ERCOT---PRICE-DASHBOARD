@@ -1,0 +1,568 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>ERCOT North Hub · 도매전력 가격 모니터</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet"/>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/recharts@2.12.7/umd/Recharts.js"></script>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%;background:#060b1a}
+  body{font-family:'Syne','Segoe UI',sans-serif;color:#e2e8f0;overflow-x:hidden}
+  ::-webkit-scrollbar{width:5px}::-webkit-scrollbar-track{background:#060b1a}
+  ::-webkit-scrollbar-thumb{background:#1e3a5f;border-radius:3px}
+  input{font-family:inherit}
+  button{font-family:inherit;cursor:pointer}
+  a{color:#60a5fa;text-decoration:none}a:hover{text-decoration:underline}
+  .mono{font-family:'Space Mono',monospace}
+  .btn{padding:5px 13px;border-radius:8px;font-size:11px;font-weight:700;
+    border:1px solid rgba(255,255,255,0.08);background:transparent;
+    color:#64748b;transition:all .15s;letter-spacing:.04em}
+  .btn.active{border-color:rgba(0,212,170,.6);background:rgba(0,212,170,.1);color:#00d4aa}
+  .btn:hover{opacity:.8}
+  #root{min-height:100vh}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+  .pulse{animation:pulse 2s infinite}
+  @keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+  .fadein{animation:fadeIn .4s ease both}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script>
+// ─────────────────────────────────────────────────────────
+// Recharts globals
+// ─────────────────────────────────────────────────────────
+const {
+  AreaChart, Area, LineChart, Line, BarChart, Bar,
+  XAxis, YAxis, CartesianGrid, Tooltip,
+  ResponsiveContainer, ReferenceLine, Legend
+} = Recharts;
+const { useState, useEffect, useCallback, useRef } = React;
+
+// ─────────────────────────────────────────────────────────
+// Seed data generator (2024-01-01 ~ today, realistic ERCOT)
+// ─────────────────────────────────────────────────────────
+function generateSeedData() {
+  const data = [];
+  const start = new Date("2024-01-02");
+  const end   = new Date("2026-05-27");
+  // deterministic RNG for reproducibility
+  let seed = 42;
+  function rand(){ seed=(seed*1664525+1013904223)>>>0; return seed/4294967296; }
+
+  function basePrice(date){
+    const m=date.getMonth(), d=date.getDate(), y=date.getFullYear();
+    let base=36;
+    // Summer peak (Jun-Aug)
+    if(m>=5&&m<=8) base=58+22*Math.sin(((m-5)/3)*Math.PI);
+    // Winter (Dec-Feb)
+    else if(m===11||m===0||m===1) base=46+14*Math.sin((m/3)*Math.PI);
+    // Spring/fall
+    else base=34+6*Math.sin((m/12)*2*Math.PI);
+    const noise=(rand()-.5)*20;
+    // winter storm spike Jan 2025
+    let spike=0;
+    if(y===2025&&m===0&&d>=13&&d<=17) spike=180+rand()*300;
+    // summer heat Aug 2025
+    if(y===2025&&m===7&&d>=10&&d<=18) spike=80+rand()*60;
+    // negative price event Apr 2024
+    if(y===2024&&m===3&&d>=6&&d<=8) return Math.max(-20, -10+rand()*10);
+    return Math.max(5, base+noise+spike);
+  }
+
+  let cur=new Date(start);
+  while(cur<=end){
+    const dow=cur.getDay();
+    if(dow!==0&&dow!==6){
+      const p=basePrice(cur);
+      const hi=p+(rand()*14);
+      const lo=Math.max(-30, p-(rand()*14));
+      data.push({
+        date:cur.toISOString().slice(0,10),
+        price:+p.toFixed(2),
+        high:+hi.toFixed(2),
+        low:+lo.toFixed(2),
+        volume:Math.round(6000+rand()*44000)
+      });
+    }
+    cur.setDate(cur.getDate()+1);
+  }
+  return data;
+}
+const SEED = generateSeedData();
+
+// ─────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────
+const fmt=(n,d=2)=>n==null||isNaN(n)?'—':Number(n).toFixed(d);
+function fmtDate(s){
+  if(!s)return'';
+  const [y,m,day]=s.split('-');
+  const mo=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  return `${mo[+m-1]} ${+day}, ${y}`;
+}
+const tickFmt=d=>{ if(!d)return''; const[,m,day]=d.split('-'); return`${m}/${day}`; };
+const RANGES=[{l:'2주',d:14},{l:'1개월',d:30},{l:'3개월',d:90},
+              {l:'6개월',d:180},{l:'1년',d:365},{l:'전체',d:9999}];
+
+// ─────────────────────────────────────────────────────────
+// Custom Tooltip
+// ─────────────────────────────────────────────────────────
+function CTooltip({active,payload}){
+  if(!active||!payload?.length)return null;
+  const d=payload[0]?.payload;
+  return React.createElement('div',{style:{
+    background:'rgba(6,11,26,.97)',border:'1px solid rgba(0,212,170,.3)',
+    borderRadius:10,padding:'10px 14px',fontSize:12,color:'#e2e8f0',minWidth:170
+  }},
+    React.createElement('div',{style:{color:'#00d4aa',fontWeight:800,marginBottom:6}},fmtDate(d?.date)),
+    payload.map((p,i)=>React.createElement('div',{key:i,style:{display:'flex',justifyContent:'space-between',gap:14}},
+      React.createElement('span',{style:{color:p.color||'#94a3b8'}},p.name),
+      React.createElement('span',{className:'mono',style:{color:'#f1f5f9',fontWeight:700}},'$'+fmt(p.value))
+    )),
+    d?.volume?React.createElement('div',{style:{marginTop:5,color:'#475569',fontSize:11}},
+      '거래량: '+(d.volume/1000).toFixed(1)+'k MWh'):null
+  );
+}
+
+// ─────────────────────────────────────────────────────────
+// Stat Card
+// ─────────────────────────────────────────────────────────
+function StatCard({label,value,sub,delta,accent='#00d4aa'}){
+  const pos=delta>0, neg=delta<0;
+  const rgb=accent==='#00d4aa'?'0,212,170':accent==='#f59e0b'?'245,158,11':'0,153,255';
+  return React.createElement('div',{className:'fadein',style:{
+    background:'linear-gradient(135deg,rgba(15,20,40,.95),rgba(20,28,55,.95))',
+    border:`1px solid rgba(${rgb},.2)`,borderRadius:14,padding:'18px 20px',
+    position:'relative',overflow:'hidden'
+  }},
+    React.createElement('div',{style:{position:'absolute',top:0,right:0,width:90,height:90,
+      background:`radial-gradient(circle at 80% 20%,${accent}1a,transparent 70%)`}}),
+    React.createElement('div',{style:{fontSize:10,color:'#475569',textTransform:'uppercase',
+      letterSpacing:'.08em',marginBottom:7}},label),
+    React.createElement('div',{style:{display:'flex',alignItems:'baseline',gap:4}},
+      React.createElement('span',{className:'mono',style:{fontSize:26,fontWeight:800,
+        color:value<0?'#f87171':'#f1f5f9'}},'$'+fmt(value)),
+      React.createElement('span',{style:{fontSize:12,color:'#64748b'}},' /MWh')
+    ),
+    delta!=null&&React.createElement('span',{style:{
+      display:'inline-flex',alignItems:'center',gap:3,marginTop:5,
+      padding:'2px 8px',borderRadius:20,fontSize:11,fontWeight:700,
+      background:pos?'rgba(239,68,68,.12)':neg?'rgba(34,197,94,.12)':'rgba(100,116,139,.1)',
+      color:pos?'#f87171':neg?'#4ade80':'#94a3b8'
+    }},
+      pos?'▲':neg?'▼':'→',' ',Math.abs(+fmt(delta,2)),'%'
+    ),
+    sub&&React.createElement('div',{style:{marginTop:4,fontSize:10,color:'#334155'}},sub)
+  );
+}
+
+// ─────────────────────────────────────────────────────────
+// Main App
+// ─────────────────────────────────────────────────────────
+function App(){
+  const [range,setRange]=useState(90);
+  const [ctype,setCtype]=useState('area');
+  const [apiKey,setApiKey]=useState(localStorage.getItem('eia_key')||'');
+  const [showKey,setShowKey]=useState(false);
+  const [liveData,setLiveData]=useState(null);
+  const [status,setStatus]=useState('sample'); // sample|loading|live|error
+  const [lastFetch,setLastFetch]=useState(null);
+  const [autoRefresh,setAutoRefresh]=useState(false);
+
+  // ── filter by range ──
+  const allData=liveData||SEED;
+  const visible=range===9999?allData:(()=>{
+    const cut=new Date(); cut.setDate(cut.getDate()-range);
+    const cs=cut.toISOString().slice(0,10);
+    return allData.filter(d=>d.date>=cs);
+  })();
+
+  const latest=visible[visible.length-1];
+  const prev2=visible[visible.length-2];
+  const maxP=Math.max(...visible.map(d=>d.high??d.price));
+  const minP=Math.min(...visible.map(d=>d.low??d.price));
+  const avgP=visible.reduce((s,d)=>s+d.price,0)/visible.length;
+  const delta=prev2?((latest?.price-prev2.price)/Math.abs(prev2.price)*100):null;
+
+  // 7-day MA
+  const withMA=visible.map((d,i,a)=>{
+    const sl=a.slice(Math.max(0,i-6),i+1);
+    return{...d,ma:+(sl.reduce((s,x)=>s+x.price,0)/sl.length).toFixed(2)};
+  });
+
+  // ── EIA fetch ──
+  const fetchEIA=useCallback(async(key)=>{
+    if(!key){alert('API Key를 입력해주세요.');return;}
+    setStatus('loading');
+    try{
+      // EIA v2: electricity wholesale price — ERCOT North daily
+      const url=`https://api.eia.gov/v2/electricity/wholesale-price/data/?api_key=${key}`+
+        `&facets[hubid][]=ERCOT-NORTH&frequency=daily`+
+        `&data[]=price&data[]=high&data[]=low`+
+        `&sort[0][column]=period&sort[0][direction]=desc&length=730`;
+      const r=await fetch(url);
+      if(!r.ok)throw new Error('HTTP '+r.status);
+      const j=await r.json();
+      if(j?.response?.data?.length){
+        const fd=j.response.data
+          .map(x=>({date:x.period,price:+(x.price||0),
+            high:+(x.high||x.price||0),low:+(x.low||x.price||0),volume:0}))
+          .filter(x=>x.price!==0)
+          .sort((a,b)=>a.date.localeCompare(b.date));
+        setLiveData(fd);setStatus('live');
+        setLastFetch(new Date().toLocaleTimeString('ko-KR'));
+        localStorage.setItem('eia_key',key);
+      } else {
+        // Try v1 series API as fallback
+        const u2=`https://api.eia.gov/series/?api_key=${key}&series_id=ELEC.WHOLESALE-PRICE.ERCOT-NORTH.D`;
+        const r2=await fetch(u2);
+        const j2=await r2.json();
+        const s=j2?.series?.[0]?.data;
+        if(s&&s.length){
+          const fd2=s.map(([dt,v])=>({date:dt.slice(0,4)+'-'+dt.slice(4,6)+'-'+dt.slice(6,8),
+            price:+v,high:+v,low:+v,volume:0}))
+            .filter(x=>x.date>='2020-01-01')
+            .sort((a,b)=>a.date.localeCompare(b.date));
+          setLiveData(fd2);setStatus('live');
+          setLastFetch(new Date().toLocaleTimeString('ko-KR'));
+          localStorage.setItem('eia_key',key);
+        } else { setStatus('error'); }
+      }
+    }catch(e){console.error(e);setStatus('error');}
+  },[]);
+
+  // auto-refresh every 30 min
+  useEffect(()=>{
+    if(!autoRefresh||!apiKey)return;
+    const id=setInterval(()=>fetchEIA(apiKey),30*60*1000);
+    return()=>clearInterval(id);
+  },[autoRefresh,apiKey,fetchEIA]);
+
+  // load on mount if key saved
+  useEffect(()=>{
+    const k=localStorage.getItem('eia_key');
+    if(k){setApiKey(k);fetchEIA(k);}
+  },[]);
+
+  // ── price spark color ──
+  const priceColor=v=>v<0?'#a78bfa':v<30?'#38bdf8':v<60?'#00d4aa':v<120?'#f59e0b':'#f87171';
+
+  // ── distribution data ──
+  const distData=(()=>{
+    const bkts=[[-50,-1],[0,20],[20,40],[40,60],[60,80],[80,120],[120,200],[200,9999]];
+    const labels=['<0','0-20','20-40','40-60','60-80','80-120','120-200','>200'];
+    return bkts.map(([lo,hi],i)=>({
+      r:labels[i],
+      n:visible.filter(d=>d.price>=lo&&d.price<hi).length
+    })).filter(b=>b.n>0);
+  })();
+
+  // ── JSX via createElement ──
+  const e=React.createElement;
+
+  // header status badge
+  const statusColor={sample:'#f59e0b',loading:'#60a5fa',live:'#4ade80',error:'#f87171'}[status];
+  const statusText={sample:'샘플 데이터',loading:'연결 중…',live:'EIA 실시간',error:'연결 오류'}[status];
+
+  return e('div',{style:{minHeight:'100vh',
+    background:'linear-gradient(160deg,#060b1a 0%,#0a1228 50%,#070d1f 100%)'}},
+
+    // ══ HEADER ══
+    e('header',{style:{
+      background:'rgba(6,11,26,.85)',backdropFilter:'blur(20px)',
+      borderBottom:'1px solid rgba(0,212,170,.1)',
+      padding:'0 28px',display:'flex',alignItems:'center',
+      justifyContent:'space-between',height:60,
+      position:'sticky',top:0,zIndex:200
+    }},
+      // Logo
+      e('div',{style:{display:'flex',alignItems:'center',gap:12}},
+        e('div',{style:{width:34,height:34,borderRadius:9,
+          background:'linear-gradient(135deg,#00d4aa,#0099ff)',
+          display:'flex',alignItems:'center',justifyContent:'center',fontSize:17}},'⚡'),
+        e('div',null,
+          e('div',{style:{fontSize:14,fontWeight:800,letterSpacing:'-.02em',color:'#f1f5f9'}},
+            'ERCOT NORTH HUB'),
+          e('div',{style:{fontSize:10,color:'#475569',letterSpacing:'.04em'}},
+            'TEXAS WHOLESALE POWER · DAILY SPOT PRICE')
+        )
+      ),
+      // Right controls
+      e('div',{style:{display:'flex',alignItems:'center',gap:10}},
+        // Status
+        e('div',{style:{display:'flex',alignItems:'center',gap:5,
+          padding:'3px 10px',borderRadius:20,fontSize:10,fontWeight:700,
+          letterSpacing:'.06em',textTransform:'uppercase',
+          background:`${statusColor}18`,color:statusColor,
+          border:`1px solid ${statusColor}40`}},
+          e('span',{className:status==='loading'?'pulse':'',style:{
+            width:5,height:5,borderRadius:'50%',background:'currentColor'}}),
+          statusText
+        ),
+        // Last fetch
+        lastFetch&&status==='live'&&e('span',{style:{fontSize:10,color:'#334155'}},
+          '갱신: ',lastFetch),
+        // Auto refresh toggle
+        status==='live'&&e('button',{
+          className:'btn '+(autoRefresh?'active':''),
+          onClick:()=>setAutoRefresh(v=>!v),
+          style:{fontSize:10,padding:'4px 10px'}
+        },autoRefresh?'🔄 자동갱신 ON':'🔄 자동갱신'),
+        // API Key button
+        e('button',{className:'btn '+(showKey?'active':''),
+          onClick:()=>setShowKey(v=>!v),
+          style:{fontSize:10,padding:'4px 10px'}
+        },showKey?'✕ 닫기':'⚙ API 설정'),
+        // EIA link
+        e('a',{href:'https://www.eia.gov/electricity/wholesale/',target:'_blank',
+          style:{fontSize:10,color:'#334155',textDecoration:'none',
+          borderLeft:'1px solid #1e2d4a',paddingLeft:10,marginLeft:2}},
+          'EIA 원본 ↗')
+      )
+    ),
+
+    // ══ BODY ══
+    e('div',{style:{maxWidth:1320,margin:'0 auto',padding:'24px 20px 56px'}},
+
+      // ── API Key Panel ──
+      showKey&&e('div',{className:'fadein',style:{
+        background:'rgba(0,153,255,.05)',border:'1px solid rgba(0,153,255,.2)',
+        borderRadius:12,padding:'18px 20px',marginBottom:20
+      }},
+        e('p',{style:{fontSize:12,color:'#94a3b8',marginBottom:10,lineHeight:1.6}},
+          '📡 데이터 출처: ',
+          e('strong',{style:{color:'#38bdf8'}},'EIA Open Data API'),
+          ' — ERCOT North 345KV Peak 일별 도매가격 (ICE 제공, 격주 업데이트).',
+          e('br'),
+          e('a',{href:'https://www.eia.gov/opendata/',target:'_blank'},'api.eia.gov/opendata'),
+          ' 에서 무료 API Key 발급 후 입력하면 실제 데이터를 불러옵니다. Key는 브라우저에 저장됩니다.'
+        ),
+        e('div',{style:{display:'flex',gap:8}},
+          e('input',{type:'password',placeholder:'EIA API Key (예: a1b2c3d4e5f6…)',
+            value:apiKey,onChange:ev=>setApiKey(ev.target.value),
+            onKeyDown:ev=>ev.key==='Enter'&&fetchEIA(apiKey),
+            style:{flex:1,background:'rgba(255,255,255,.05)',
+              border:'1px solid rgba(0,212,170,.2)',borderRadius:8,
+              color:'#e2e8f0',padding:'8px 12px',fontSize:13,outline:'none'}}),
+          e('button',{onClick:()=>fetchEIA(apiKey),
+            style:{padding:'8px 18px',borderRadius:8,
+              background:'linear-gradient(135deg,#00d4aa,#0099ff)',
+              color:'#fff',fontWeight:800,border:'none',fontSize:13,whiteSpace:'nowrap'
+            }},'불러오기'),
+          liveData&&e('button',{onClick:()=>{setLiveData(null);setStatus('sample');},
+            style:{padding:'8px 14px',borderRadius:8,
+              background:'rgba(239,68,68,.1)',color:'#f87171',
+              border:'1px solid rgba(239,68,68,.2)',fontSize:12}},'초기화')
+        ),
+        status==='error'&&e('p',{style:{marginTop:8,fontSize:11,color:'#f87171'}},
+          '⚠ API 연결 실패. Key를 확인하거나 EIA 서버 상태를 점검해주세요.')
+      ),
+
+      // ── Stat Cards ──
+      e('div',{style:{display:'grid',
+        gridTemplateColumns:'repeat(auto-fit,minmax(200px,1fr))',gap:14,marginBottom:20}},
+        e(StatCard,{label:'최신 종가 (Wtd Avg)',value:latest?.price,delta,
+          sub:latest?'기준일: '+fmtDate(latest.date):''}),
+        e(StatCard,{label:'기간 최고가',value:maxP,accent:'#f59e0b',sub:'High (Peak)'}),
+        e(StatCard,{label:'기간 최저가',value:minP,accent:'#0099ff',
+          sub:minP<0?'⚠ 음수 가격 발생':'Low'}),
+        e(StatCard,{label:'기간 평균가',value:avgP,sub:visible.length+'개 거래일'})
+      ),
+
+      // ── Main Chart ──
+      e('div',{style:{
+        background:'linear-gradient(135deg,rgba(15,20,40,.95),rgba(20,28,55,.95))',
+        border:'1px solid rgba(0,212,170,.1)',borderRadius:16,
+        padding:'22px 22px 14px',marginBottom:16
+      }},
+        // Controls row
+        e('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'center',
+          marginBottom:18,flexWrap:'wrap',gap:10}},
+          e('div',null,
+            e('span',{style:{fontSize:14,fontWeight:800,color:'#f1f5f9',
+              letterSpacing:'-.01em'}},'일별 도매가격 추이'),
+            e('span',{style:{marginLeft:8,fontSize:11,color:'#334155'}},
+              'ERCOT North · $/MWh Peak Day-Ahead')
+          ),
+          e('div',{style:{display:'flex',gap:5,flexWrap:'wrap'}},
+            // chart type
+            ['area','line','bar'].map(t=>e('button',{key:t,
+              className:'btn '+(ctype===t?'active':''),
+              onClick:()=>setCtype(t)},
+              t==='area'?'📈 Area':t==='line'?'〰 Line':'📊 Bar'
+            )),
+            e('span',{style:{width:1,background:'rgba(255,255,255,.06)',margin:'0 3px'}}),
+            // range
+            RANGES.map(r=>e('button',{key:r.l,
+              className:'btn '+(range===r.d?'active':''),
+              onClick:()=>setRange(r.d)},r.l))
+          )
+        ),
+
+        // Chart
+        e(ResponsiveContainer,{width:'100%',height:320},
+          ctype==='bar'?
+            e(BarChart,{data:withMA,margin:{top:4,right:8,left:0,bottom:0}},
+              e(CartesianGrid,{strokeDasharray:'3 3',stroke:'rgba(255,255,255,.04)'}),
+              e(XAxis,{dataKey:'date',tickFormatter:tickFmt,
+                tick:{fontSize:9,fill:'#475569'},minTickGap:28}),
+              e(YAxis,{tick:{fontSize:9,fill:'#475569'},
+                tickFormatter:v=>'$'+v,domain:['auto','auto']}),
+              e(Tooltip,{content:e(CTooltip)}),
+              e(Bar,{dataKey:'price',name:'종가',fill:'#00d4aa',
+                fillOpacity:.7,radius:[3,3,0,0]})
+            ):
+          ctype==='line'?
+            e(LineChart,{data:withMA,margin:{top:4,right:8,left:0,bottom:0}},
+              e(CartesianGrid,{strokeDasharray:'3 3',stroke:'rgba(255,255,255,.04)'}),
+              e(XAxis,{dataKey:'date',tickFormatter:tickFmt,
+                tick:{fontSize:9,fill:'#475569'},minTickGap:28}),
+              e(YAxis,{tick:{fontSize:9,fill:'#475569'},
+                tickFormatter:v=>'$'+v,domain:['auto','auto']}),
+              e(Tooltip,{content:e(CTooltip)}),
+              e(Legend,{wrapperStyle:{fontSize:10,color:'#64748b'}}),
+              e(ReferenceLine,{y:0,stroke:'rgba(168,85,247,.4)',strokeDasharray:'3 3'}),
+              e(ReferenceLine,{y:avgP,stroke:'rgba(0,153,255,.4)',strokeDasharray:'4 2'}),
+              e(Line,{type:'monotone',dataKey:'price',name:'종가',
+                stroke:'#00d4aa',strokeWidth:1.8,dot:false}),
+              e(Line,{type:'monotone',dataKey:'ma',name:'7일 이동평균',
+                stroke:'#f59e0b',strokeWidth:2,dot:false,strokeDasharray:'5 2'})
+            ):
+          // area (default)
+          e(AreaChart,{data:withMA,margin:{top:4,right:8,left:0,bottom:0}},
+            e('defs',null,
+              e('linearGradient',{id:'g1',x1:'0',y1:'0',x2:'0',y2:'1'},
+                e('stop',{offset:'5%',stopColor:'#00d4aa',stopOpacity:.3}),
+                e('stop',{offset:'95%',stopColor:'#00d4aa',stopOpacity:.02})
+              ),
+              e('linearGradient',{id:'g2',x1:'0',y1:'0',x2:'0',y2:'1'},
+                e('stop',{offset:'5%',stopColor:'#f59e0b',stopOpacity:.15}),
+                e('stop',{offset:'95%',stopColor:'#f59e0b',stopOpacity:0})
+              )
+            ),
+            e(CartesianGrid,{strokeDasharray:'3 3',stroke:'rgba(255,255,255,.04)'}),
+            e(XAxis,{dataKey:'date',tickFormatter:tickFmt,
+              tick:{fontSize:9,fill:'#475569'},minTickGap:28}),
+            e(YAxis,{tick:{fontSize:9,fill:'#475569'},
+              tickFormatter:v=>'$'+v,domain:['auto','auto']}),
+            e(Tooltip,{content:e(CTooltip)}),
+            e(Legend,{wrapperStyle:{fontSize:10,color:'#64748b'}}),
+            e(ReferenceLine,{y:0,stroke:'rgba(168,85,247,.5)',
+              strokeDasharray:'3 3',label:{value:'$0',fill:'#a78bfa',fontSize:9}}),
+            e(ReferenceLine,{y:avgP,stroke:'rgba(0,153,255,.35)',strokeDasharray:'4 2'}),
+            e(Area,{type:'monotone',dataKey:'price',name:'종가 ($/MWh)',
+              stroke:'#00d4aa',strokeWidth:2,fill:'url(#g1)',dot:false}),
+            e(Area,{type:'monotone',dataKey:'ma',name:'7일 이동평균',
+              stroke:'#f59e0b',strokeWidth:1.5,fill:'url(#g2)',
+              dot:false,strokeDasharray:'5 2'})
+          )
+        )
+      ),
+
+      // ── Bottom Row ──
+      e('div',{style:{display:'grid',gridTemplateColumns:'1fr 1.5fr',gap:14}},
+
+        // Distribution chart
+        e('div',{style:{
+          background:'linear-gradient(135deg,rgba(15,20,40,.95),rgba(20,28,55,.95))',
+          border:'1px solid rgba(0,212,170,.1)',borderRadius:16,padding:'20px 18px 12px'
+        }},
+          e('div',{style:{fontSize:10,color:'#475569',textTransform:'uppercase',
+            letterSpacing:'.08em',marginBottom:12}},'가격 분포 ($/MWh 구간별 거래일 수)'),
+          e(ResponsiveContainer,{width:'100%',height:200},
+            e(BarChart,{data:distData,margin:{top:2,right:4,left:-20,bottom:0}},
+              e(CartesianGrid,{strokeDasharray:'3 3',stroke:'rgba(255,255,255,.04)'}),
+              e(XAxis,{dataKey:'r',tick:{fontSize:8,fill:'#475569'}}),
+              e(YAxis,{tick:{fontSize:8,fill:'#475569'}}),
+              e(Tooltip,{
+                contentStyle:{background:'#0a1228',
+                  border:'1px solid rgba(0,212,170,.2)',borderRadius:8,fontSize:11},
+                itemStyle:{color:'#00d4aa'},labelStyle:{color:'#94a3b8'},
+                formatter:(v)=>[v+'일','거래일']}),
+              e(Bar,{dataKey:'n',name:'거래일',fill:'#00d4aa',
+                fillOpacity:.65,radius:[4,4,0,0]})
+            )
+          )
+        ),
+
+        // Recent table
+        e('div',{style:{
+          background:'linear-gradient(135deg,rgba(15,20,40,.95),rgba(20,28,55,.95))',
+          border:'1px solid rgba(0,212,170,.1)',borderRadius:16,padding:'20px 18px'
+        }},
+          e('div',{style:{fontSize:10,color:'#475569',textTransform:'uppercase',
+            letterSpacing:'.08em',marginBottom:12}},'최근 거래일 데이터'),
+          e('div',{style:{overflowX:'auto'}},
+            e('table',{style:{width:'100%',borderCollapse:'collapse',fontSize:11}},
+              e('thead',null,e('tr',null,
+                ...['날짜','종가 $/MWh','High','Low','전일비','거래량'].map(h=>
+                  e('th',{key:h,style:{textAlign:h==='날짜'?'left':'right',
+                    padding:'5px 8px',color:'#334155',fontWeight:700,
+                    borderBottom:'1px solid rgba(255,255,255,.06)',
+                    whiteSpace:'nowrap',fontSize:10}},h)
+                )
+              )),
+              e('tbody',null,
+                ...[...visible].reverse().slice(0,14).map((d,i,arr)=>{
+                  const pv=arr[i+1];
+                  const chg=pv?((d.price-pv.price)/Math.abs(pv.price)*100):null;
+                  return e('tr',{key:d.date,style:{
+                    borderBottom:'1px solid rgba(255,255,255,.04)',
+                    background:i%2===0?'transparent':'rgba(255,255,255,.01)'}},
+                    e('td',{style:{padding:'6px 8px',color:'#64748b',whiteSpace:'nowrap'}},
+                      fmtDate(d.date)),
+                    e('td',{className:'mono',style:{padding:'6px 8px',textAlign:'right',
+                      fontWeight:700,
+                      color:d.price<0?'#a78bfa':d.price>100?'#f87171':'#f1f5f9'}},
+                      '$'+fmt(d.price)),
+                    e('td',{className:'mono',style:{padding:'6px 8px',textAlign:'right',
+                      color:'#f87171',fontSize:10}},'$'+fmt(d.high)),
+                    e('td',{className:'mono',style:{padding:'6px 8px',textAlign:'right',
+                      color:d.low<0?'#a78bfa':'#4ade80',fontSize:10}},'$'+fmt(d.low)),
+                    e('td',{style:{padding:'6px 8px',textAlign:'right'}},
+                      chg!=null?e('span',{style:{
+                        color:chg>0?'#f87171':'#4ade80',fontWeight:700,fontSize:11
+                      }},(chg>0?'+':'')+fmt(chg,1)+'%'):'—'
+                    ),
+                    e('td',{style:{padding:'6px 8px',textAlign:'right',
+                      color:'#334155',fontSize:10}},
+                      d.volume?(d.volume/1000).toFixed(0)+'k':'—')
+                  );
+                })
+              )
+            )
+          )
+        )
+      ),
+
+      // ── Footer ──
+      e('div',{style:{marginTop:24,paddingTop:14,
+        borderTop:'1px solid rgba(255,255,255,.05)',
+        display:'flex',justifyContent:'space-between',
+        alignItems:'center',flexWrap:'wrap',gap:8}},
+        e('div',{style:{fontSize:10,color:'#1e3a5f'}},
+          '데이터: ',
+          e('a',{href:'https://www.eia.gov/electricity/wholesale/',target:'_blank',
+            style:{color:'#334155'}},
+            'U.S. EIA Wholesale Electricity & Natural Gas Markets'),
+          ' · ICE 제공 · ERCOT North 345KV Peak · 격주 업데이트'
+        ),
+        e('div',{style:{fontSize:10,color:'#1e2d4a'}},
+          '⚡ 본 페이지는 정보 제공 목적이며 투자 조언이 아닙니다')
+      )
+
+    )// body end
+  );// root end
+}
+
+// ─────────────────────────────────────────────────────────
+ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(App));
+</script>
+</body>
+</html>
